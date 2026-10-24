@@ -1,541 +1,922 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""venvpy — 把 Python 脚本装进干净的虚拟环境并打包成独立可执行文件。
+
+	 python main.py                        # 打包当前目录下所有 .py
+	 python main.py app.py tool/           # 指定文件 / 目录
+	 python main.py src -o dist --mode onedir --python 3.12
+	 python main.py --init                 # 生成 <脚本>.pack.toml 模板
+	 python main.py --dry-run              # 只打印计划，不执行
+
+需要 Python 3.11+（内置 tomllib），没有别的第三方依赖。
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import fnmatch
 import os
+import shlex
+import shutil
 import subprocess
 import sys
-import ast
 import time
-import multiprocessing
-import platform  # 用于 freeze_support 和潜在的平台特定逻辑
-from pathlib import Path # 使用 pathlib 更方便地处理路径
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-# 尝试导入 tomllib (Python 3.11+) 或回退到 toml
 try:
-    import tomllib
-except ImportError:
-    try:
-        # 将 'toml' 库作为 'tomllib' 使用
-        import toml as tomllib
-        print("[信息] 正在使用 'toml' 库解析配置 (适用于 Python < 3.11)。请确保已安装 (`pip install toml`)。")
-    except ImportError:
-        print("[错误] 未找到 TOML 解析库。请安装 (`pip install toml`) 或使用 Python 3.11+。")
-        sys.exit(1)
-
-# --- 配置常量 ---
-# !! 重要：请在此处设置你的 UPX 可执行文件的完整路径 !!
-# 示例:
-# UPX_DIR = r"D:\upx-4.2.4-win64\upx.exe" # Windows 示例
-# UPX_DIR = r"C:\Program Files\upx\upx.exe" # Windows 默认安装路径示例
-UPX_DIR = r"/usr/local/bin/upx"         # Linux/Mac 示例 (如果安装在这里)
-# 如果不想使用 UPX，设置 UPX_DIR = None
-# UPX_DIR = None
-
-# 默认设置 (可在 .pack.toml 中覆盖)
-DEFAULT_PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}" # 使用当前Python版本进行标准库检查
-DEFAULT_PACK_MODE = "onefile"  # 'onefile' (单文件) 或 'onedir' (单目录)
-DEFAULT_LOG_LEVEL = "INFO"     # PyInstaller 日志级别 (DEBUG, INFO, WARN, ERROR)
-VENV_NAME = "packager_venv_cn" # 虚拟环境目录名
-
-# --- 全局变量 ---
-script_start_time = time.time() # 记录脚本开始时间
-# 确定项目根目录 (脚本所在目录)
-project_root_dir = Path(__file__).parent if getattr(sys, 'frozen', False) is False else Path(sys.executable).parent
-
-# --- 辅助函数 ---
-def print_debug(message, level="调试"):
-    """打印带时间戳的格式化调试/信息消息。"""
-    elapsed_time = time.time() - script_start_time
-    print(f"[{level} {elapsed_time:.2f}秒] {message}")
-
-def get_python_executable(venv_dir):
-    """获取虚拟环境内的 python 可执行文件路径。"""
-    if platform.system() == "Windows":
-        return venv_dir / "Scripts" / "python.exe"
-    else:
-        return venv_dir / "bin" / "python"
-
-def get_pip_executable(venv_dir):
-    """获取虚拟环境内的 pip 可执行文件路径。"""
-    if platform.system() == "Windows":
-        return venv_dir / "Scripts" / "pip.exe"
-    else:
-        return venv_dir / "bin" / "pip"
-
-def run_subprocess(cmd_list, check=True, timeout=None, capture=True, cwd=None, extra_env=None):
-    """辅助运行子进程，捕获输出，并提供更好的调试信息。"""
-    cmd_str = ' '.join(map(str, cmd_list))
-    print_debug(f"执行命令: {cmd_str}", level="命令")
-    try:
-        process = subprocess.run(
-            cmd_list,
-            check=check,            # 如果为 True，返回码非0时抛出异常
-            capture_output=capture, # 是否捕获标准输出和标准错误
-            text=True,              # 使用文本模式（自动解码）
-            encoding='utf-8',       # 指定编码
-            errors='ignore',        # 忽略解码错误
-            timeout=timeout,        # 命令超时时间（秒）
-            cwd=cwd,                # 命令执行的工作目录
-            env={**os.environ, **(extra_env or {})}, # 合并环境变量
-        )
-        if capture:
-            # 打印输出的最后几行以供参考
-            output_lines = process.stdout.strip().splitlines() if process.stdout else []
-            if output_lines:
-                print_debug(f"命令标准输出 (最后几行):\n..." + "\n...".join(output_lines[-5:]), level="命令输出")
-            if process.stderr:
-                 print_debug(f"命令标准错误:\n{process.stderr.strip()}", level="命令错误")
-
-        return process
-    except subprocess.CalledProcessError as e:
-        print_debug(f"命令执行失败，返回码 {e.returncode}", level="错误")
-        if capture:
-            print_debug(f"失败命令的标准输出:\n{e.stdout}", level="错误")
-            print_debug(f"失败命令的标准错误:\n{e.stderr}", level="错误")
-        if check:
-            raise # 如果 check=True，重新抛出异常
-        return None # 如果 check=False 且执行失败，返回 None
-    except subprocess.TimeoutExpired as e:
-        print_debug(f"命令执行超时 ({timeout} 秒)。", level="错误")
-        if capture:
-            print_debug(f"超时命令的标准输出:\n{e.stdout}", level="错误")
-            print_debug(f"超时命令的标准错误:\n{e.stderr}", level="错误")
-        if check:
-            raise
-        return None
-    except Exception as e:
-        print_debug(f"运行子进程时发生意外错误: {e}", level="严重错误")
-        raise
-
-
-# --- 配置加载 ---
-def load_pack_config(py_file_path):
-    """加载与 .py 文件关联的 .pack.toml 配置文件。"""
-    config_file = py_file_path.with_suffix(".pack.toml")
-    # 默认配置结构
-    default_config = {
-        "packaging": {"mode": DEFAULT_PACK_MODE, "log_level": DEFAULT_LOG_LEVEL},
-        "dependencies": {"pip_install": []},
-        "pyinstaller": {
-            "hidden_imports": [],
-            "add_data": [],
-            "add_binary": [],
-            "exclude_modules": [],
-            "extra_args": [],
-        },
-    }
-    if config_file.is_file():
-        print_debug(f"加载配置文件: {config_file.name}")
-        try:
-            with open(config_file, "rb") as f: # 以二进制模式读取以供 tomllib 处理
-                loaded_config = tomllib.load(f)
-
-            # 将加载的配置与默认配置合并（简单合并，列表会被覆盖）
-            # 更健壮的合并可能需要递归更新字典和扩展列表
-            merged_config = default_config.copy()
-            for section, settings in loaded_config.items():
-                if section in merged_config and isinstance(merged_config[section], dict):
-                    merged_config[section].update(settings)
-                else:
-                     merged_config[section] = settings # 添加或覆盖整个部分
-            return merged_config
-        except tomllib.TOMLDecodeError as e:
-            print_debug(f"解析 TOML 文件 {config_file.name} 时出错: {e}", level="警告")
-            return default_config # 解析错误时返回默认配置
-        except Exception as e:
-            print_debug(f"读取配置文件 {config_file.name} 时出错: {e}", level="警告")
-            return default_config
-    else:
-        print_debug(f"未找到 {py_file_path.name} 的配置文件，使用默认设置。")
-        return default_config
-
-# --- 核心功能函数 ---
-def create_virtualenv(venv_dir):
-    """创建或验证虚拟环境。"""
-    step_start_time = time.time()
-    print_debug(f"确保虚拟环境存在: {venv_dir}", level="信息")
-    if not venv_dir.exists():
-        print_debug(f"正在创建虚拟环境...")
-        run_subprocess([sys.executable, "-m", "venv", str(venv_dir)])
-        print_debug(f"虚拟环境已创建。")
-    else:
-        print_debug(f"使用现有虚拟环境。")
-    step_elapsed = time.time() - step_start_time
-    print_debug(f"虚拟环境设置完成，耗时 {step_elapsed:.2f} 秒", level="信息")
-
-def install_core_dependencies(venv_dir):
-    """在虚拟环境中安装核心打包器依赖 (PyInstaller, stdlib_list)。"""
-    step_start_time = time.time()
-    print_debug("安装核心打包器依赖 (PyInstaller, stdlib_list)...", level="信息")
-    pip_exe = get_pip_executable(venv_dir)
-
-    # 首先升级 pip
-    print_debug("正在升级 pip...")
-    run_subprocess([str(pip_exe), "install", "--upgrade", "pip"], check=False) # pip 升级失败不应中断脚本
-
-    # 安装核心包
-    print_debug("正在安装 pyinstaller, stdlib_list...")
-    # 注意：如果此脚本自身需要 stdlib_list 但在全局环境运行，这里可能找不到。
-    # 最好是从创建好的虚拟环境中运行此打包脚本，或者全局安装 stdlib_list。
-    # 为简单起见，假设 stdlib_list 可访问。
-    run_subprocess([str(pip_exe), "install", "pyinstaller", "stdlib_list"])
-
-    step_elapsed = time.time() - step_start_time
-    print_debug(f"核心依赖安装完成，耗时 {step_elapsed:.2f} 秒", level="信息")
-
-
-def get_script_dependencies(py_file_path):
-    """使用 AST 分析 Python 脚本以查找静态导入。"""
-    print_debug(f"正在 AST 分析导入: {py_file_path.name}")
-    modules = set()
-    try:
-        source = py_file_path.read_text(encoding='utf-8')
-        tree = ast.parse(source, filename=str(py_file_path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    # 获取导入路径的第一部分作为潜在的包名
-                    modules.add(alias.name.split('.')[0])
-            elif isinstance(node, ast.ImportFrom):
-                # 只处理绝对导入 (level=0)，并确保 module 存在
-                if node.level == 0 and node.module:
-                    modules.add(node.module.split('.')[0])
-        print_debug(f"AST 找到模块: {modules if modules else '{}'}")
-        return modules
-    except FileNotFoundError:
-        print_debug(f"文件未找到: {py_file_path}", level="警告")
-        return set()
-    except SyntaxError as e:
-        print_debug(f"{py_file_path.name} 中存在语法错误: {e}", level="错误")
-        return set() # 发生错误时返回空集合
-    except Exception as e:
-        print_debug(f"分析 {py_file_path.name} 时出错: {e}", level="错误")
-        return set()
-
-def install_project_dependencies(venv_dir, all_modules_to_install):
-    """在虚拟环境中安装所有收集到的项目依赖。"""
-    if not all_modules_to_install:
-        print_debug("没有需要安装的项目特定依赖。", level="信息")
-        return
-
-    step_start_time = time.time()
-    # 过滤掉可能的空字符串或None
-    valid_modules = {m for m in all_modules_to_install if m}
-    if not valid_modules:
-        print_debug("过滤后没有有效的项目依赖项需要安装。", level="信息")
-        return
-
-    print_debug(f"正在安装项目依赖: {', '.join(valid_modules)}", level="信息")
-    pip_exe = get_pip_executable(venv_dir)
-
-    # 尝试一次性安装所有依赖，可能更快，但出错不易定位
-    cmd = [str(pip_exe), "install"] + list(valid_modules)
-    process = run_subprocess(cmd, check=False) # 先不检查退出码
-
-    if process is None or process.returncode != 0:
-         print_debug(f"批量安装依赖失败。将尝试逐一安装...", level="警告")
-         success_count = 0
-         failed_modules = []
-         for module in valid_modules:
-             try:
-                 print_debug(f"尝试单独安装: {module}")
-                 run_subprocess([str(pip_exe), "install", module], check=True)
-                 success_count += 1
-             except Exception as inner_e:
-                 print_debug(f"单独安装依赖失败: {module}。错误: {inner_e}", level="错误")
-                 failed_modules.append(module)
-
-         step_elapsed = time.time() - step_start_time
-         print_debug(f"逐一安装尝试完成。成功: {success_count}/{len(valid_modules)}。耗时: {step_elapsed:.2f} 秒", level="信息")
-         if failed_modules:
-              print_debug(f"以下依赖未能安装: {', '.join(failed_modules)}。后续打包可能会失败。", level="警告")
-         # 根据需求决定是否在这里中断脚本
-         # if failed_modules: sys.exit(1)
-    else:
-        step_elapsed = time.time() - step_start_time
-        print_debug(f"项目依赖批量安装完成，耗时 {step_elapsed:.2f} 秒", level="信息")
-
-
-    # 可选：列出虚拟环境中已安装的包
-    print_debug("列出虚拟环境中的已安装包:")
-    run_subprocess([str(pip_exe), "list"], check=False)
-
-
-def package_py_to_exe(venv_dir, py_file_path, output_dir, config):
-    """使用 PyInstaller 打包单个 Python 文件，并应用配置。"""
-    step_start_time = time.time()
-    script_name = py_file_path.name
-    print_debug(f"开始为 {script_name} 进行打包", level="信息")
-
-    # 定位 PyInstaller 可执行文件
-    if platform.system() == "Windows":
-        pyinstaller_exe = get_python_executable(venv_dir).parent / "pyinstaller.exe"
-    else:
-        pyinstaller_exe = get_python_executable(venv_dir).parent / "pyinstaller"
-
-    # --- 构建 PyInstaller 参数列表 ---
-    pyinstaller_args = [str(pyinstaller_exe)]
-
-    # 打包模式 (onefile/onedir)
-    pack_mode = config.get("packaging", {}).get("mode", DEFAULT_PACK_MODE)
-    pyinstaller_args.append(f"--{pack_mode}")
-
-    # UPX 压缩
-    upx_path = UPX_DIR # 从全局常量获取
-    if upx_path and Path(upx_path).exists():
-        # PyInstaller 需要的是 UPX 所在的 *目录*
-        # 如果 UPX_DIR 直接指向了 exe 文件，取其父目录
-        upx_dir_path = Path(upx_path)
-        if upx_dir_path.is_file():
-             upx_dir_path = upx_dir_path.parent
-        pyinstaller_args.extend(["--upx-dir", str(upx_dir_path)])
-        print_debug(f"UPX 已启用，路径: {upx_dir_path}")
-    elif upx_path:
-        print_debug(f"UPX 路径 '{upx_path}' 无效或不存在，UPX 已禁用。", level="警告")
-    else:
-        print_debug("UPX 未配置 (UPX_DIR 为 None)，UPX 已禁用。", level="信息")
-
-
-    # 隐藏导入
-    for imp in config.get("pyinstaller", {}).get("hidden_imports", []):
-        pyinstaller_args.extend(["--hidden-import", imp])
-
-    # 添加数据文件
-    for data_spec in config.get("pyinstaller", {}).get("add_data", []):
-        # PyInstaller 需要的格式是 "源路径:目标路径" (Windows上用';',其他系统用':')
-        separator = ';' if platform.system() == "Windows" else ':'
-        # 确保我们使用正确的路径分隔符
-        formatted_spec = data_spec.replace(':', separator)
-        pyinstaller_args.extend(["--add-data", formatted_spec])
-
-    # 添加二进制文件
-    for binary_spec in config.get("pyinstaller", {}).get("add_binary", []):
-        separator = ';' if platform.system() == "Windows" else ':'
-        formatted_spec = binary_spec.replace(':', separator)
-        pyinstaller_args.extend(["--add-binary", formatted_spec])
-
-    # 排除模块 (谨慎使用!)
-    for mod in config.get("pyinstaller", {}).get("exclude_modules", []):
-        pyinstaller_args.extend(["--exclude-module", mod])
-
-    # 基础参数
-    pyinstaller_args.extend([
-        "--distpath", str(output_dir), # 输出目录
-        "--noconfirm",                 # 不经确认覆盖输出
-        "--clean",                     # 构建前清理缓存
-    ])
-
-    # 日志级别
-    log_level = config.get("packaging", {}).get("log_level", DEFAULT_LOG_LEVEL)
-    pyinstaller_args.extend([f"--log-level={log_level.upper()}"])
-
-    # 来自配置文件的额外参数
-    pyinstaller_args.extend(config.get("pyinstaller", {}).get("extra_args", []))
-
-    # 需要打包的脚本文件路径 (必须是最后一个参数)
-    pyinstaller_args.append(str(py_file_path))
-    # --- 参数构建结束 ---
-
-
-    print_debug(f"准备为 {script_name} 执行 PyInstaller...", level="信息")
-    # 打印将要执行的命令，对带空格的参数加上引号，方便复制调试
-    cmd_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in pyinstaller_args)
-    print(f"[命令 {time.time() - script_start_time:.2f}秒] {cmd_str}")
-
-    print("\n" + f"--- {script_name} 的 PyInstaller 输出 ---")
-    return_code = 1 # 默认为失败状态
-    try:
-        # 使用 Popen 实时获取和打印输出
-        process = subprocess.Popen(
-            pyinstaller_args,
-            stdout=subprocess.PIPE,       # 捕获标准输出
-            stderr=subprocess.STDOUT,      # 将标准错误重定向到标准输出
-            text=True,                   # 使用文本模式
-            encoding='utf-8',            # 指定编码
-            errors='ignore',             # 忽略解码错误
-            bufsize=1,                   # 行缓冲模式
-            cwd=project_root_dir,        # 在项目根目录执行 PyInstaller
-            # shell=False is default and recommended
-        )
-
-        # 逐行读取并打印 PyInstaller 的输出
-        while True:
-            line = process.stdout.readline()
-            if not line: # 当输出结束时 readline 返回空字符串
-                break
-            current_elapsed = time.time() - script_start_time
-            # 可以在这里添加过滤逻辑，去除不关心的日志行
-            # if "some noisy pattern" not in line:
-            print(f"[{current_elapsed:.2f}秒 PyI] {line.strip()}") # PyI = PyInstaller 输出标记
-
-        process.wait() # 等待子进程结束
-        return_code = process.returncode # 获取最终的返回码
-        print(f"--- {script_name} 的 PyInstaller 执行完毕 (返回码: {return_code}) ---")
-
-    except FileNotFoundError:
-        print_debug(f"严重错误：未在以下路径找到 PyInstaller 可执行文件: {pyinstaller_exe}", level="严重错误")
-        raise # 抛出严重错误
-    except Exception as e:
-        print_debug(f"在为 {script_name} 执行 PyInstaller 时发生意外错误: {e}", level="严重错误")
-        # 可选：在此处记录完整的 traceback
-        raise # 重新抛出未预料到的错误
-
-    step_elapsed = time.time() - step_start_time
-    if return_code == 0:
-        print_debug(f"成功打包 {script_name}，耗时 {step_elapsed:.2f} 秒", level="成功")
-        return True
-    else:
-        print_debug(f"打包 {script_name} 失败，耗时 {step_elapsed:.2f} 秒", level="错误")
-        return False
-
-
-# --- 并行执行包装器 ---
-def package_task_wrapper(args):
-    """用于在多进程池中运行 package_py_to_exe 的包装函数。"""
-    venv_dir, py_file_path, output_dir, config, global_start_time = args
-    # 注意：全局开始时间无法简单地跨进程共享给 print_debug 使用。
-    # 子进程中的 print_debug 计时将相对于子进程的启动时间。
-    # 这里主要关心的是任务成功与否的返回值。
-    process_id = os.getpid()
-    script_name = py_file_path.name
-    print(f"[进程 {process_id}] 开始处理任务: {script_name}")
-    start = time.time()
-    try:
-        # 调用实际的打包函数
-        success = package_py_to_exe(venv_dir, py_file_path, output_dir, config)
-        end = time.time()
-        print(f"[进程 {process_id}] 完成任务: {script_name}，耗时 {end-start:.2f} 秒。成功: {success}")
-        return success # 返回布尔值表示成功或失败
-    except Exception as e:
-        end = time.time()
-        import traceback
-        # 打印详细错误信息，包括堆栈跟踪
-        print(f"[进程 {process_id}] 严重错误：处理 {script_name} 任务时发生异常，耗时 {end-start:.2f} 秒: {e}\n{traceback.format_exc()}")
-        return False # 确保报告失败
-
-# --- 主程序 ---
-def main():
-    print_debug(f"打包脚本启动。根目录: {project_root_dir}", level="信息")
-    venv_dir = project_root_dir / VENV_NAME      # 虚拟环境目录路径
-    output_dir = project_root_dir / "dist_packaged" # 单独的输出目录
-
-    # 确保输出目录存在
-    output_dir.mkdir(exist_ok=True)
-    print_debug(f"输出目录: {output_dir}", level="信息")
-
-    try:
-        # === 阶段 1: 分析脚本和加载配置 ===
-        print_debug("--- 阶段 1：分析脚本并加载配置 ---", level="阶段")
-        scripts_to_package = [] # 存储找到的 .py 文件 Path 对象
-        all_configs = {}        # 存储每个脚本的配置字典 {Path: config_dict}
-        ast_discovered_modules = set() # 存储所有脚本通过 AST 分析找到的模块
-
-        # 查找当前目录下的 .py 文件，排除脚本自身
-        self_script_name = Path(__file__).name
-        for item in project_root_dir.iterdir():
-            # 必须是文件、以 .py 结尾、且不是本脚本自身
-            if item.is_file() and item.suffix == ".py" and item.name != self_script_name:
-                scripts_to_package.append(item)
-                # 加载或获取默认配置
-                config = load_pack_config(item)
-                all_configs[item] = config
-                # 分析脚本依赖
-                ast_discovered_modules.update(get_script_dependencies(item))
-
-        if not scripts_to_package:
-            print_debug("未在本目录找到需要打包的 Python 脚本 (已排除打包脚本自身)。退出。", level="警告")
-            return
-
-        print_debug(f"找到 {len(scripts_to_package)} 个待打包脚本: {[p.name for p in scripts_to_package]}", level="信息")
-
-        # === 阶段 2: 设置虚拟环境和核心依赖 ===
-        print_debug("--- 阶段 2：设置环境 ---", level="阶段")
-        create_virtualenv(venv_dir)
-        install_core_dependencies(venv_dir) # 安装 PyInstaller 等
-
-        # === 阶段 3: 安装合并的项目依赖 ===
-        print_debug("--- 阶段 3：安装合并的项目依赖 ---", level="阶段")
-        # 合并 AST 发现的模块和所有配置文件中手动指定的 pip 依赖
-        manual_pip_installs = set()
-        for config in all_configs.values():
-            manual_pip_installs.update(config.get("dependencies", {}).get("pip_install", []))
-
-        # 确定需要安装的第三方依赖（过滤掉标准库）
-        try:
-            # 尝试从虚拟环境中导入 stdlib_list (它应该在 Phase 2 中被安装)
-            # 这需要确保 Python 能找到 venv 中的包路径
-            # 一个简单的方法是修改 sys.path，或者更推荐从 venv 运行此脚本
-            sys.path.insert(0, str(venv_dir / ('Lib' if platform.system() == 'Windows' else f'lib/python{DEFAULT_PYTHON_VERSION}') / 'site-packages'))
-            from stdlib_list import stdlib_list as sl_list
-            standard_libs = set(sl_list(DEFAULT_PYTHON_VERSION))
-            print_debug(f"已加载 Python {DEFAULT_PYTHON_VERSION} 的标准库列表")
-            sys.path.pop(0) # 恢复 sys.path
-        except ImportError:
-            print_debug("无法导入 stdlib_list。标准库检查将被跳过。", level="警告")
-            standard_libs = set() # 无法检查时，保守地认为所有模块都不是标准库
-        except Exception as e:
-            print_debug(f"加载标准库列表时出错: {e}", level="警告")
-            standard_libs = set()
-
-        modules_to_install = set()
-        # 合并 AST 找到的模块和手动指定的模块
-        combined_discovered = ast_discovered_modules | manual_pip_installs
-        for module_or_specifier in combined_discovered:
-            # 做一些基本判断来过滤掉标准库
-            # 注意：这个判断逻辑可以进一步完善，例如处理带版本号的 specifier
-            module_base = module_or_specifier.split('==')[0].split('<')[0].split('>')[0].split('[')[0].split('.')[0].strip()
-            if module_base and module_base not in standard_libs:
-                 modules_to_install.add(module_or_specifier) # 添加原始 specifier 或模块名
-
-
-        # 安装所有收集到的依赖
-        install_project_dependencies(venv_dir, modules_to_install)
-
-        # === 阶段 4: 并行打包 ===
-        print_debug("--- 阶段 4：开始并行打包 ---", level="阶段")
-        # 设置工作进程数，可以调整，例如留一个核心给系统
-        num_workers = max(1, os.cpu_count() - 1) if os.cpu_count() else 1
-        print_debug(f"将使用最多 {num_workers} 个工作进程进行打包。")
-
-        # 准备传递给每个打包任务的参数列表
-        tasks = []
-        for script_path in scripts_to_package:
-            # 每个任务是一个元组，包含所有需要的信息
-            tasks.append((venv_dir, script_path, output_dir, all_configs[script_path], script_start_time))
-
-        results = [] # 存储每个任务的返回结果 (True/False)
-        try:
-            # 创建进程池并执行任务
-            # map 会阻塞，直到所有任务完成
-            with multiprocessing.Pool(processes=num_workers) as pool:
-                results = pool.map(package_task_wrapper, tasks)
-        except Exception as pool_error:
-             print_debug(f"多进程池执行期间发生错误: {pool_error}", level="严重错误")
-             # 可能需要更健壮的清理或报告机制
-
-        # === 阶段 5: 报告结果 ===
-        print_debug("--- 阶段 5：打包完成 ---", level="阶段")
-        successful_packs = sum(1 for r in results if r is True)
-        failed_packs = len(results) - successful_packs
-        print_debug(f"处理的总脚本数: {len(scripts_to_package)}", level="信息")
-        print_debug(f"成功打包数量: {successful_packs}", level="成功" if failed_packs == 0 else "信息")
-        if failed_packs > 0:
-            print_debug(f"失败打包数量: {failed_packs}", level="错误")
-            # 可以考虑列出失败的脚本名称，需要稍微修改结果跟踪方式
-
-    except Exception as e:
-        # 捕获主流程中的其他意外错误
-        print_debug(f"主执行流程中发生意外错误: {e}", level="严重错误")
-        import traceback
-        print("------ 错误追踪 ------")
-        traceback.print_exc()
-        print("-----------------------")
-        sys.exit(1) # 异常退出
-    finally:
-        # 无论成功或失败，都打印总耗时
-        total_elapsed = time.time() - script_start_time
-        print_debug(f"脚本执行完毕。总耗时: {total_elapsed:.2f} 秒。", level="信息")
+	import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+	sys.exit("[错误] 需要 Python 3.11 或更高版本（内置 tomllib 解析配置）。")
+
+
+__version__ = "2.0.0"
+PROG = "venvpy"
+
+if not sys.stdout.isatty():  # 管道/重定向时统一成 utf-8，免得中文日志乱码
+	try:
+		sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+		sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+	except (AttributeError, OSError):
+		pass
+
+DEFAULT_VENV = ".venvpy"
+DEFAULT_DIST = "dist_packaged"
+BUILD_DIR = ".venvpy-build"
+
+SKIP_DIRS = {
+	".git", ".hg", ".svn", "__pycache__", "node_modules", "site-packages",
+	"build", "dist", "dist_packaged", "venv", "env", ".venv", ".venvpy", BUILD_DIR,
+}
+
+# 导入名 ≠ PyPI 包名的常见情况。其余靠当前解释器里已装的包反查。
+IMPORT_TO_PACKAGE = {
+	"cv2": "opencv-python",
+	"PIL": "Pillow",
+	"yaml": "PyYAML",
+	"bs4": "beautifulsoup4",
+	"sklearn": "scikit-learn",
+	"skimage": "scikit-image",
+	"attr": "attrs",
+	"dateutil": "python-dateutil",
+	"dotenv": "python-dotenv",
+	"jwt": "PyJWT",
+	"jose": "python-jose",
+	"nacl": "PyNaCl",
+	"Crypto": "pycryptodome",
+	"OpenSSL": "pyOpenSSL",
+	"serial": "pyserial",
+	"usb": "pyusb",
+	"win32api": "pywin32",
+	"win32con": "pywin32",
+	"win32gui": "pywin32",
+	"win32com": "pywin32",
+	"pythoncom": "pywin32",
+	"pkg_resources": "setuptools",
+	"google.protobuf": "protobuf",
+	"docx": "python-docx",
+	"pptx": "python-pptx",
+	"fitz": "PyMuPDF",
+	"magic": "python-magic",
+	"slugify": "python-slugify",
+	"multipart": "python-multipart",
+	"socketio": "python-socketio",
+	"engineio": "python-engineio",
+	"telegram": "python-telegram-bot",
+	"Levenshtein": "python-Levenshtein",
+	"gi": "PyGObject",
+	"wx": "wxPython",
+	"ffmpeg": "ffmpeg-python",
+	"grpc": "grpcio",
+	"zmq": "pyzmq",
+	"MySQLdb": "mysqlclient",
+	"psycopg2": "psycopg2-binary",
+	"pymysql": "PyMySQL",
+	"dns": "dnspython",
+	"websocket": "websocket-client",
+	"snappy": "python-snappy",
+	"ldap": "python-ldap",
+	"git": "GitPython",
+	"babel": "Babel",
+	"markdown": "Markdown",
+	"ruamel": "ruamel.yaml",
+}
+
+LOG_LEVEL = "INFO"
+START_TIME = time.time()
+
+
+def log(message: str, level: str = "info") -> None:
+	if level == "debug" and LOG_LEVEL != "DEBUG":
+		return
+	if level == "info" and LOG_LEVEL == "QUIET":
+		return
+	if LOG_LEVEL == "QUIET" and level not in ("warn", "error"):
+		return
+	tag = {"debug": "调试", "info": "信息", "warn": "警告", "error": "错误"}.get(level, level)
+	print(f"[{tag} {time.time() - START_TIME:6.2f}s] {message}", flush=True)
+
+
+class ToolError(RuntimeError):
+	pass
+
+
+# ---------------------------------------------------------------- 子进程
+
+def _child_env(extra: dict | None) -> dict:
+	env = os.environ.copy()
+	env.setdefault("PYTHONIOENCODING", "utf-8")
+	env.setdefault("PYTHONUTF8", "1")
+	env.pop("PYTHONHOME", None)
+	if extra:
+		env.update(extra)
+	return env
+
+
+def run(cmd: list, cwd: Path | None = None, check: bool = True, extra_env: dict | None = None):
+	log("$ " + " ".join(shlex.quote(str(c)) for c in cmd), "debug")
+	try:
+		proc = subprocess.run(
+			[str(c) for c in cmd],
+			cwd=str(cwd) if cwd else None,
+			capture_output=True,
+			text=True,
+			encoding="utf-8",
+			errors="replace",
+			env=_child_env(extra_env),
+		)
+	except FileNotFoundError as exc:
+		raise ToolError(f"找不到可执行文件: {cmd[0]}") from exc
+	if proc.returncode != 0 and check:
+		detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+		raise ToolError(f"命令失败（退出码 {proc.returncode}）: {cmd[0]}\n{detail[-3000:]}")
+	return proc
+
+
+def run_stream(cmd: list, cwd: Path | None = None) -> tuple[int, list[str]]:
+	"""边跑边收集输出，供打包时打印日志。"""
+	log("$ " + " ".join(shlex.quote(str(c)) for c in cmd), "debug")
+	try:
+		proc = subprocess.Popen(
+			[str(c) for c in cmd],
+			cwd=str(cwd) if cwd else None,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT,
+			text=True,
+			encoding="utf-8",
+			errors="replace",
+			bufsize=1,
+			env=_child_env(None),
+		)
+	except FileNotFoundError as exc:
+		raise ToolError(f"找不到可执行文件: {cmd[0]}") from exc
+	lines: list[str] = []
+	assert proc.stdout is not None
+	for line in proc.stdout:
+		lines.append(line.rstrip("\r\n"))
+	proc.wait()
+	return proc.returncode, lines
+
+
+# ---------------------------------------------------------------- 配置
+
+def _default_config() -> dict:
+	return {
+		"packaging": {
+			"mode": "onefile",
+			"name": "",
+			"icon": "",
+			"log_level": "INFO",
+			"windowed": False,
+			"upx_dir": "",
+			"python": "",
+			"backend": "auto",
+			"venv": DEFAULT_VENV,
+			"dist": DEFAULT_DIST,
+			"jobs": 0,
+			"extra_pyinstaller_args": [],
+		},
+		"dependencies": {
+			"pip_install": [],
+			"requirements": [],
+		},
+		"pyinstaller": {
+			"hidden_imports": [],
+			"add_data": [],
+			"add_binary": [],
+			"exclude_modules": [],
+			"collect_all": [],
+		},
+	}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+	merged = {}
+	for key, value in base.items():
+		if key in override:
+			new_value = override[key]
+			if isinstance(value, dict) and isinstance(new_value, dict):
+				merged[key] = _deep_merge(value, new_value)
+			else:
+				merged[key] = new_value
+		else:
+			merged[key] = value
+	for key, value in override.items():
+		if key not in merged:
+			merged[key] = value
+	return merged
+
+
+def read_toml(path: Path) -> dict | None:
+	if not path.is_file():
+		return None
+	try:
+		with open(path, "rb") as fh:
+			return tomllib.load(fh)
+	except tomllib.TOMLDecodeError as exc:
+		log(f"配置文件 {path.name} 解析失败，已忽略: {exc}", "warn")
+		return None
+	except OSError as exc:
+		log(f"配置文件 {path.name} 读取失败，已忽略: {exc}", "warn")
+		return None
+
+
+def resolve_config(script: Path, root: Path, cli: dict) -> dict:
+	"""默认值 <- 根目录 venvpy.toml <- <脚本>.pack.toml <- 命令行。"""
+	cfg = _default_config()
+	for path in (root / "venvpy.toml", script.with_suffix(".pack.toml")):
+		data = read_toml(path)
+		if data:
+			log(f"加载配置: {path}", "debug")
+			cfg = _deep_merge(cfg, data)
+	return _deep_merge(cfg, cli)
+
+
+def config_template(script: Path, deps: list[str]) -> str:
+	dep_lines = "".join(f'\t"{d}",\n' for d in deps)
+	if dep_lines:
+		dep_body = f"pip_install = [\n{dep_lines}]"
+	else:
+		dep_body = "pip_install = []"
+	return f"""# {script.name} 的 venvpy 配置（命令行参数优先级更高）
+
+[packaging]
+mode = "onefile"          # onefile | onedir
+# name = "MyApp"          # 输出名字，默认取脚本名
+# icon = "app.ico"
+windowed = false          # 带 GUI、不想弹黑框时改成 true
+# upx_dir = "C:/tools/upx"  # 留空 = 自动在 PATH 里找 upx
+# python = "3.12"         # 建环境用的 Python 版本
+# backend = "auto"        # auto | uv | pip
+
+[dependencies]
+{dep_body}
+
+[pyinstaller]
+hidden_imports = []
+# add_data = ["config.json:.", {{ src = "assets", dest = "assets" }}]
+add_binary = []
+exclude_modules = []
+collect_all = []          # 等价于 --collect-all
+"""
+
+
+# ---------------------------------------------------------------- 发现脚本
+
+def pick_config_root(targets: list[str]) -> Path:
+	"""项目配置（venvpy.toml / requirements / pyproject）去哪里找。
+
+	只给了一个目录就把它当项目根，否则用当前目录。
+	"""
+	dirs = [
+		Path(t).resolve() for t in targets
+		if not any(ch in t for ch in "*?[") and Path(t).is_dir()
+	]
+	return dirs[0] if len(dirs) == 1 else Path.cwd().resolve()
+
+
+def _is_self(path: Path) -> bool:
+	try:
+		if path.resolve() == Path(__file__).resolve():
+			return True
+	except OSError:
+		pass
+	if getattr(sys, "frozen", False):
+		try:
+			return path.resolve() == Path(sys.executable).resolve()
+		except OSError:
+			pass
+	return False
+
+
+def _excluded(path: Path, root: Path, patterns: list[str]) -> bool:
+	rel = path.relative_to(root).as_posix() if root in path.parents else path.as_posix()
+	return any(
+		fnmatch.fnmatch(path.name, p) or fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(str(path), p)
+		for p in patterns
+	)
+
+
+def discover(targets: list[str], excludes: list[str], skip_paths: set[Path]) -> list[Path]:
+	files: list[Path] = []
+	seen: set[Path] = set()
+
+	def add(path: Path) -> None:
+		resolved = path.resolve()
+		if resolved in seen or _is_self(path):
+			return
+		if any(resolved == s or s in resolved.parents for s in skip_paths):
+			return
+		seen.add(resolved)
+		files.append(path)
+
+	for raw in targets:
+		pattern_hit = any(ch in raw for ch in "*?[")
+		candidates: list[Path] = []
+		if pattern_hit:
+			candidates = sorted(Path().glob(raw))
+		else:
+			candidates = [Path(raw)]
+
+		for candidate in candidates:
+			if candidate.is_dir():
+				root = candidate.resolve()
+				for current, dirs, names in os.walk(candidate):
+					cur = Path(current)
+					dirs[:] = sorted(
+						d for d in dirs
+						if d not in SKIP_DIRS and not d.startswith(".") and not _excluded(cur / d, root, excludes)
+					)
+					for name in sorted(names):
+						if name.endswith(".py") and not _excluded(cur / name, root, excludes):
+							add(cur / name)
+			elif candidate.is_file():
+				if candidate.suffix != ".py":
+					raise ToolError(f"不是 Python 文件: {candidate}")
+				if not _excluded(candidate, candidate.parent, excludes):
+					add(candidate)
+			elif pattern_hit:
+				continue
+			else:
+				raise ToolError(f"路径不存在: {candidate}")
+
+	return sorted(files)
+
+
+# ---------------------------------------------------------------- 依赖推断
+
+def _stdlib_names() -> set[str]:
+	return set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
+
+
+def _installed_module_map() -> dict[str, str]:
+	"""用当前解释器已装的包，反查 导入名 -> 发行包名。"""
+	try:
+		from importlib.metadata import packages_distributions
+
+		return {mod: dists[0] for mod, dists in packages_distributions().items() if dists}
+	except Exception:
+		return {}
+
+
+def scan_imports(files: list[Path]) -> set[str]:
+	modules: set[str] = set()
+	for path in files:
+		try:
+			source = path.read_text(encoding="utf-8", errors="replace")
+			tree = ast.parse(source, filename=str(path))
+		except SyntaxError as exc:
+			log(f"{path.name} 有语法错误，跳过依赖分析: {exc}", "warn")
+			continue
+		except OSError as exc:
+			log(f"{path.name} 读取失败，跳过依赖分析: {exc}", "warn")
+			continue
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Import):
+				modules.update(alias.name.split(".")[0] for alias in node.names)
+			elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+				modules.add(node.module.split(".")[0])
+	log(f"AST 扫描到导入: {', '.join(sorted(modules)) or '无'}", "debug")
+	return modules
+
+
+def local_module_names(files: list[Path]) -> set[str]:
+	names = {path.stem for path in files}
+	for path in files:
+		if path.stem == "__init__":
+			names.add(path.parent.name)
+		# 只打包单个文件时，同目录的兄弟模块也算本地模块
+		try:
+			for sibling in path.parent.glob("*.py"):
+				names.add(sibling.stem)
+			for child in path.parent.iterdir():
+				if child.is_dir() and (child / "__init__.py").is_file():
+					names.add(child.name)
+		except OSError:
+			continue
+	names.discard("__init__")
+	return names
+
+
+def _project_dependencies(root: Path) -> list[str]:
+	pyproject = root / "pyproject.toml"
+	data = read_toml(pyproject)
+	if not data:
+		return []
+	deps = data.get("project", {}).get("dependencies", [])
+	return [str(d) for d in deps]
+
+
+def _requirement_files(root: Path, configured: list[str]) -> list[Path]:
+	found: list[Path] = []
+	for raw in configured:
+		path = (root / raw).resolve() if not Path(raw).is_absolute() else Path(raw)
+		if not path.is_file():
+			raise ToolError(f"requirements 文件不存在: {raw}")
+		found.append(path)
+	auto = root / "requirements.txt"
+	if auto.is_file() and auto.resolve() not in found:
+		found.append(auto.resolve())
+	return found
+
+
+def infer_dependencies(
+	files: list[Path], cfg: dict, root: Path, siblings: list[Path] | None = None
+) -> tuple[list[str], list[Path]]:
+	"""返回 (要 pip install 的包列表, requirements 文件列表)。
+
+	files 是本次要分析导入的脚本，siblings 是整个项目里能找到的脚本，
+	用来识别「自己项目内的模块」，避免把 utils 当成要 pip 安装的包。
+	"""
+	stdlib = _stdlib_names()
+	locals_ = local_module_names(siblings if siblings is not None else files)
+	installed = _installed_module_map()
+
+	packages: list[str] = []
+	seen: set[str] = set()
+
+	def package_key(spec: str) -> str:
+		name = spec.strip()
+		for char in "<>=!~[;":
+			name = name.split(char)[0]
+		return name.strip().lower()
+
+	def add_package(spec: str) -> None:
+		key = package_key(spec)
+		if key and key not in seen:
+			seen.add(key)
+			packages.append(spec.strip())
+
+	for spec in cfg["dependencies"].get("pip_install", []):
+		if isinstance(spec, str) and spec.strip():
+			add_package(spec)
+
+	for module in sorted(scan_imports(files)):
+		if module in stdlib or module in locals_:
+			continue
+		package = IMPORT_TO_PACKAGE.get(module) or installed.get(module) or module
+		add_package(package)
+
+	for dep in _project_dependencies(root):
+		add_package(dep)
+
+	return packages, _requirement_files(root, cfg["dependencies"].get("requirements", []))
+
+
+# ---------------------------------------------------------------- 环境
+
+def find_uv() -> str | None:
+	return shutil.which("uv")
+
+
+def venv_python(venv_dir: Path) -> Path:
+	return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def ensure_venv(venv_dir: Path, python_spec: str, backend: str, recreate: bool) -> Path:
+	python_exe = venv_python(venv_dir)
+	if recreate and venv_dir.exists():
+		log(f"删除旧虚拟环境: {venv_dir}", "warn")
+		shutil.rmtree(venv_dir)
+	if python_exe.is_file():
+		log(f"复用虚拟环境: {venv_dir}")
+		return python_exe
+	if venv_dir.exists():
+		if not (venv_dir / "pyvenv.cfg").is_file():
+			raise ToolError(f"{venv_dir} 已存在但不是虚拟环境，换个 --venv 路径或先手动清理。")
+		shutil.rmtree(venv_dir)
+		log(f"重建损坏的虚拟环境: {venv_dir}", "warn")
+
+	uv = find_uv()
+	use_uv = backend == "uv" or (backend == "auto" and uv)
+	if backend == "uv" and not uv:
+		raise ToolError("指定了 --backend uv，但 PATH 里找不到 uv。")
+
+	log(f"创建虚拟环境: {venv_dir}（{'uv' if use_uv else 'venv'}）")
+	if use_uv:
+		cmd = [uv, "venv", str(venv_dir)]
+		if python_spec:
+			cmd += ["--python", python_spec]
+		run(cmd)
+	else:
+		current = f"{sys.version_info.major}.{sys.version_info.minor}"
+		if python_spec and not current.startswith(python_spec):
+			log(f"pip 后端只能用当前解释器 {current}，忽略 --python {python_spec}", "warn")
+		run([sys.executable, "-m", "venv", str(venv_dir)])
+
+	if not python_exe.is_file():
+		raise ToolError(f"虚拟环境创建失败，找不到 {python_exe}")
+	return python_exe
+
+
+def install(python_exe: Path, backend: str, packages: list[str], req_files: list[Path]) -> None:
+	if not packages and not req_files:
+		log("没有额外依赖需要安装")
+		return
+	uv = find_uv()
+	use_uv = backend == "uv" or (backend == "auto" and uv)
+	base = ([uv, "pip", "install", "--python", str(python_exe)] if use_uv
+	        else [str(python_exe), "-m", "pip", "install"])
+
+	args = list(base)
+	for req in req_files:
+		args += ["-r", str(req)]
+	args += packages
+	log(f"安装依赖: {', '.join(packages) or '（仅 requirements）'}")
+	proc = run(args, check=False)
+	if proc.returncode == 0:
+		return
+
+	log("一次性安装失败，改为逐个重试", "warn")
+	failed: list[str] = []
+	for package in packages:
+		retry = base + [package]
+		if run(retry, check=False).returncode != 0:
+			failed.append(package)
+	if failed:
+		log(f"这些包没装上: {', '.join(failed)}；打包可能失败", "warn")
+
+
+def install_pyinstaller(python_exe: Path, backend: str) -> None:
+	uv = find_uv()
+	use_uv = backend == "uv" or (backend == "auto" and uv)
+	if use_uv:
+		cmd = [uv, "pip", "install", "--python", str(python_exe), "pyinstaller"]
+	else:
+		run([str(python_exe), "-m", "pip", "install", "--upgrade", "pip"], check=False)
+		cmd = [str(python_exe), "-m", "pip", "install", "pyinstaller"]
+	log("准备打包工具 PyInstaller")
+	run(cmd)
+
+
+# ---------------------------------------------------------------- PyInstaller
+
+def _resolve_src(src: str, bases: list[Path]) -> str:
+	path = Path(src)
+	if path.is_absolute():
+		return str(path)
+	for base in bases:
+		candidate = base / path
+		if candidate.exists():
+			return str(candidate.resolve())
+	return src
+
+
+def _data_spec(spec, bases: list[Path]) -> str:
+	"""把 'src:dest' 或 {src=..., dest=...} 转成 PyInstaller 需要的 src<os.pathsep>dest。
+
+	相对路径先在脚本所在目录找，再在当前目录找。
+	"""
+	if isinstance(spec, dict):
+		src = spec.get("src") or spec.get("source")
+		dest = spec.get("dest") or spec.get("destination") or "."
+		if not src:
+			raise ToolError(f"add_data/add_binary 缺少 src: {spec}")
+		return f"{_resolve_src(str(src), bases)}{os.pathsep}{dest}"
+	spec = str(spec)
+	sep = os.pathsep if os.pathsep in spec else ":"
+	if sep not in spec:
+		raise ToolError(f"add_data/add_binary 格式应为 src:dest，收到: {spec}")
+	src, dest = spec.rsplit(sep, 1)
+	return f"{_resolve_src(src, bases)}{os.pathsep}{dest}"
+
+
+def resolve_upx(cfg: dict, no_upx: bool) -> Path | None:
+	if no_upx:
+		return None
+	raw = cfg["packaging"].get("upx_dir") or ""
+	if raw:
+		path = Path(raw).expanduser()
+		if path.is_file():
+			path = path.parent
+		if not path.is_dir():
+			log(f"UPX 路径不存在，已禁用: {raw}", "warn")
+			return None
+		return path
+	found = shutil.which("upx")
+	return Path(found).parent if found else None
+
+
+def build_command(
+	python_exe: Path, script: Path, name: str, cfg: dict,
+	dist_dir: Path, work_dir: Path, spec_dir: Path, upx: Path | None,
+) -> list:
+	pack = cfg["packaging"]
+	pyi = cfg["pyinstaller"]
+	args = [str(python_exe), "-m", "PyInstaller", f"--{pack['mode']}", "--noconfirm", "--clean"]
+	args += ["--name", name, "--distpath", str(dist_dir), "--workpath", str(work_dir),
+	         "--specpath", str(spec_dir), f"--log-level={str(pack.get('log_level', 'INFO')).upper()}"]
+
+	if pack.get("windowed"):
+		args.append("--windowed")
+	if pack.get("icon"):
+		args += ["--icon", str(pack["icon"])]
+	if upx:
+		args += ["--upx-dir", str(upx)]
+	bases = [script.parent.resolve(), Path.cwd().resolve()]
+	for module in pyi.get("hidden_imports", []):
+		args += ["--hidden-import", str(module)]
+	for spec in pyi.get("add_data", []):
+		args += ["--add-data", _data_spec(spec, bases)]
+	for spec in pyi.get("add_binary", []):
+		args += ["--add-binary", _data_spec(spec, bases)]
+	for module in pyi.get("exclude_modules", []):
+		args += ["--exclude-module", str(module)]
+	for module in pyi.get("collect_all", []):
+		args += ["--collect-all", str(module)]
+	args += [str(a) for a in pack.get("extra_pyinstaller_args", [])]
+	args.append(str(script))
+	return args
+
+
+def build_one(task: dict) -> dict:
+	name = task["name"]
+	log(f"开始打包 {task['script'].name} -> {name}")
+	code, lines = run_stream(task["cmd"], cwd=task["cwd"])
+	dist, name = task["dist_dir"], task["name"]
+	if task["mode"] == "onedir":
+		artifacts = [dist / name, dist / f"{name}.exe"]
+	else:
+		artifacts = [dist / f"{name}.exe", dist / name]
+	ok = code == 0 and any(a.exists() for a in artifacts)
+	if code == 0 and not ok:
+		log(f"{name} 打包命令成功但没找到产物 {artifacts[0]}", "warn")
+	return {"name": name, "script": task["script"], "ok": ok, "code": code, "lines": lines}
+
+
+# ---------------------------------------------------------------- 主流程
+
+def build_cli_overrides(args: argparse.Namespace) -> dict:
+	over: dict = {"packaging": {}, "dependencies": {}, "pyinstaller": {}}
+	pack = over["packaging"]
+	if args.mode:
+		pack["mode"] = args.mode
+	if args.name:
+		pack["name"] = args.name
+	if args.icon:
+		pack["icon"] = args.icon
+	if args.windowed:
+		pack["windowed"] = True
+	if args.python:
+		pack["python"] = args.python
+	if args.backend:
+		pack["backend"] = args.backend
+	if args.venv:
+		pack["venv"] = args.venv
+	if args.output:
+		pack["dist"] = args.output
+	if args.jobs is not None:
+		pack["jobs"] = args.jobs
+	if args.upx_dir:
+		pack["upx_dir"] = args.upx_dir
+	if args.extra_arg:
+		pack["extra_pyinstaller_args"] = args.extra_arg
+
+	deps = over["dependencies"]
+	if args.requirements:
+		deps["requirements"] = args.requirements
+	if args.pip:
+		deps["pip_install"] = args.pip
+
+	pyi = over["pyinstaller"]
+	if args.hidden_import:
+		pyi["hidden_imports"] = args.hidden_import
+	if args.add_data:
+		pyi["add_data"] = args.add_data
+	if args.add_binary:
+		pyi["add_binary"] = args.add_binary
+	if args.collect_all:
+		pyi["collect_all"] = args.collect_all
+	return over
+
+
+def print_plan(plans: list[dict], python_spec: str, backend: str, venv_dir: Path, dist_dir: Path) -> None:
+	print(f"\n{PROG} {__version__} 计划")
+	print(f"  环境      : {venv_dir}（后端 {backend}，Python {python_spec or '默认'}）")
+	print(f"  输出      : {dist_dir}")
+	for item in plans:
+		cfg = item["config"]
+		print(f"  - {item['script']}  ->  {item['name']}  [{cfg['packaging']['mode']}]")
+		if item["packages"]:
+			print(f"      依赖: {', '.join(item['packages'])}")
+		for req in item["req_files"]:
+			print(f"      requirements: {req}")
+	if not plans:
+		print("  （没有找到要打包的脚本）")
+	print()
+
+
+def main(argv: list[str] | None = None) -> int:
+	global LOG_LEVEL
+	parser = argparse.ArgumentParser(
+		prog=PROG,
+		description="扫描 Python 脚本，自动建虚拟环境、装依赖、用 PyInstaller 打包。",
+		epilog="配置文件：./venvpy.toml 全局生效，<脚本名>.pack.toml 只管对应脚本。命令行参数优先级最高。",
+	)
+	parser.add_argument("targets", nargs="*", help="要打包的文件、目录或通配符，默认当前目录")
+	parser.add_argument("-o", "--output", help=f"输出目录（默认 {DEFAULT_DIST}）")
+	parser.add_argument("--venv", help=f"虚拟环境目录（默认 {DEFAULT_VENV}）")
+	parser.add_argument("--python", help="建环境用的 Python 版本，例如 3.12（uv 后端生效）")
+	parser.add_argument("--backend", choices=["auto", "uv", "pip"], help="装包后端，默认 auto（有 uv 用 uv）")
+	parser.add_argument("--mode", choices=["onefile", "onedir"], help="单文件还是单目录")
+	parser.add_argument("--name", help="输出名字，默认取脚本名")
+	parser.add_argument("--icon", help="图标文件")
+	parser.add_argument("--windowed", action="store_true", help="GUI 程序，不带控制台窗口")
+	parser.add_argument("--jobs", type=int, help="同时打包几个，默认按 CPU 自动")
+	parser.add_argument("--upx-dir", help="UPX 所在目录，默认在 PATH 里找")
+	parser.add_argument("--no-upx", action="store_true", help="禁用 UPX 压缩")
+	parser.add_argument("--requirements", action="append", help="额外 requirements 文件，可重复")
+	parser.add_argument("--pip", action="append", help="手动补充要安装的包，可重复")
+	parser.add_argument("--hidden-import", action="append", help="PyInstaller 隐藏导入，可重复")
+	parser.add_argument("--add-data", action="append", help="src:dest，可重复")
+	parser.add_argument("--add-binary", action="append", help="src:dest，可重复")
+	parser.add_argument("--collect-all", action="append", help="收集整个包的资源，可重复")
+	parser.add_argument("--extra-arg", action="append", help="原样传给 PyInstaller 的参数，可重复")
+	parser.add_argument("--exclude", action="append", default=[], help="跳过匹配的文件/目录，可重复")
+	parser.add_argument("--init", action="store_true", help="生成 <脚本>.pack.toml 模板后退出")
+	parser.add_argument("--dry-run", action="store_true", help="只打印计划，不创建环境也不打包")
+	parser.add_argument("--recreate", action="store_true", help="删除并重建虚拟环境")
+	parser.add_argument("--clean", action="store_true", help="打包前删除虚拟环境、构建缓存和输出目录")
+	parser.add_argument("--skip-deps", action="store_true", help="跳过用户依赖安装，只装 PyInstaller")
+	parser.add_argument("--log-level", default="INFO", choices=["QUIET", "INFO", "DEBUG"], help="日志级别")
+	parser.add_argument("-v", "--verbose", action="store_true", help="等同 --log-level DEBUG")
+	parser.add_argument("-q", "--quiet", action="store_true", help="只看警告和错误")
+	parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+	args = parser.parse_args(argv)
+
+	LOG_LEVEL = "DEBUG" if args.verbose else ("QUIET" if args.quiet else args.log_level)
+	root = Path.cwd()
+	targets = args.targets or ["."]
+	config_root = pick_config_root(targets)
+	cli_over = build_cli_overrides(args)
+
+	# --clean 要先知道路径，所以先粗读一份全局配置
+	preview = _deep_merge(_default_config(), read_toml(config_root / "venvpy.toml") or {})
+	preview = _deep_merge(preview, cli_over)
+	venv_dir = (root / preview["packaging"]["venv"]).resolve()
+	dist_dir = (root / preview["packaging"]["dist"]).resolve()
+	build_root = (root / BUILD_DIR).resolve()
+
+	try:
+		files = discover(targets, args.exclude, {venv_dir, dist_dir, build_root})
+	except ToolError as exc:
+		log(str(exc), "error")
+		return 2
+
+	if not files:
+		log("没找到要打包的 .py 文件", "warn")
+		return 1
+
+	if args.init:
+		for script in files:
+			cfg = resolve_config(script, config_root, {"packaging": {}, "dependencies": {}, "pyinstaller": {}})
+			packages, _ = infer_dependencies([script], cfg, config_root, siblings=files)
+			target = script.with_suffix(".pack.toml")
+			if target.exists():
+				log(f"已存在，跳过: {target}", "warn")
+				continue
+			target.write_text(config_template(script, packages), encoding="utf-8")
+			log(f"已生成: {target}")
+		return 0
+
+	plans: list[dict] = []
+	seen_names: dict[str, int] = {}
+	try:
+		for script in files:
+			cfg = resolve_config(script, config_root, cli_over)
+			pack = cfg["packaging"]
+			name = pack.get("name") or script.stem
+			if name in seen_names:
+				if not pack.get("name"):
+					name = f"{script.parent.name}_{script.stem}"
+				log(f"输出名重复，改用 {name}", "warn")
+			seen_names[name] = 1
+			packages, req_files = infer_dependencies([script], cfg, config_root, siblings=files)
+			plans.append({
+				"script": script,
+				"name": name,
+				"config": cfg,
+				"packages": [] if args.skip_deps else packages,
+				"req_files": [] if args.skip_deps else req_files,
+			})
+	except ToolError as exc:
+		log(str(exc), "error")
+		return 2
+
+	pack0 = plans[0]["config"]["packaging"]
+	venv_dir = (root / (args.venv or pack0["venv"])).resolve()
+	dist_dir = (root / (args.output or pack0["dist"])).resolve()
+	backend = (args.backend or pack0["backend"] or "auto")
+	python_spec = args.python or pack0.get("python") or ""
+
+	if LOG_LEVEL != "QUIET":
+		print_plan(plans, python_spec, backend, venv_dir, dist_dir)
+	if args.dry_run:
+		log("dry-run 结束，没有做任何改动")
+		return 0
+
+	if args.clean:
+		for path in (venv_dir, build_root, dist_dir):
+			if path.exists():
+				log(f"清理 {path}", "warn")
+				shutil.rmtree(path, ignore_errors=True)
+
+	try:
+		python_exe = ensure_venv(venv_dir, python_spec, backend, args.recreate or args.clean)
+		install_pyinstaller(python_exe, backend)
+		if not args.skip_deps:
+			all_packages: list[str] = []
+			all_reqs: list[Path] = []
+			for item in plans:
+				for pkg in item["packages"]:
+					if pkg.lower() not in {p.lower() for p in all_packages}:
+						all_packages.append(pkg)
+				for req in item["req_files"]:
+					if req not in all_reqs:
+						all_reqs.append(req)
+			install(python_exe, backend, all_packages, all_reqs)
+	except ToolError as exc:
+		log(str(exc), "error")
+		return 1
+
+	upx = resolve_upx(plans[0]["config"], args.no_upx)
+	if upx:
+		log(f"使用 UPX: {upx}")
+
+	dist_dir.mkdir(parents=True, exist_ok=True)
+	tasks = []
+	for item in plans:
+		work_dir = build_root / item["name"]
+		work_dir.mkdir(parents=True, exist_ok=True)
+		cmd = build_command(
+			python_exe, item["script"], item["name"], item["config"],
+			dist_dir, work_dir, work_dir, upx,
+		)
+		tasks.append({
+			"cmd": cmd, "name": item["name"], "script": item["script"],
+			"dist_dir": dist_dir, "mode": item["config"]["packaging"]["mode"], "cwd": root,
+		})
+
+	jobs = args.jobs or plans[0]["config"]["packaging"].get("jobs") or 0
+	if not jobs or jobs < 1:
+		jobs = min(4, os.cpu_count() or 1)
+	jobs = max(1, min(jobs, len(tasks)))
+	log(f"并行打包 {len(tasks)} 个脚本（{jobs} 个任务）")
+
+	results: list[dict] = []
+	if jobs == 1:
+		for task in tasks:
+			try:
+				results.append(build_one(task))
+			except ToolError as exc:
+				log(str(exc), "error")
+				results.append({"name": task["name"], "script": task["script"], "ok": False, "code": -1, "lines": []})
+	else:
+		with ThreadPoolExecutor(max_workers=jobs) as pool:
+			futures = {pool.submit(build_one, task): task for task in tasks}
+			for future in as_completed(futures):
+				task = futures[future]
+				try:
+					results.append(future.result())
+				except Exception as exc:  # noqa: BLE001 - 保证每个任务都有结果
+					log(f"{task['name']} 打包异常: {exc}", "error")
+					results.append({"name": task["name"], "script": task["script"], "ok": False, "code": -1, "lines": []})
+
+	failed = [r for r in results if not r["ok"]]
+	for result in results:
+		if result["ok"]:
+			log(f"完成 {result['script'].name} -> {result['name']}", "info")
+		else:
+			log(f"失败 {result['script'].name}（退出码 {result['code']}）", "error")
+			for line in result["lines"][-30:]:
+				print(f"    {line}")
+	log(f"成功 {len(results) - len(failed)} / {len(results)}，产物在 {dist_dir}")
+	return 0 if not failed else 1
 
 
 if __name__ == "__main__":
-    # 在 Windows 上使用 multiprocessing 打包成 exe 时需要此调用
-    multiprocessing.freeze_support()
-    main()
+	try:
+		sys.exit(main())
+	except KeyboardInterrupt:
+		print("\n已中断", file=sys.stderr)
+		sys.exit(130)

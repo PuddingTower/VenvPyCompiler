@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# venvpy 自己生成的
+.venvpy/
+.venvpy-build/
+dist_packaged/
+dist/
+build/
+*.spec
+
+# 常见的本地环境
+.venv/
+venv/
+env/
